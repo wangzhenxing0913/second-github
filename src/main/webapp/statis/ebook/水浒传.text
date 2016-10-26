@@ -1,0 +1,736 @@
+
+
+使用Dubbo进行远程调用实现服务交互，它支持多种协议，如Hessian、HTTP、RMI、Memcached、Redis、 Thrift等等。由于Dubbo将这些协议的实现进行了封装了，无论是服务端（开发服务）还是客户端（调用服务），都不需要关心协议的细节，只需要在配 置中指定使用的协议即可，从而保证了服务提供方与服务消费方之间的透明。
+另外，如果我们使用Dubbo的服务注册中心组件，这样服务提供方将服务发布到注册的中心，只是将服务的名称暴露给外部，而服务消费方只需要知道注册中心 和服务提供方提供的服务名称，就能够透明地调用服务，后面我们会看到具体提供服务和消费服务的配置内容，使得双方之间交互的透明化。
+
+示例场景
+
+我们给出一个示例的应用场景：
+服务方提供一个搜索服务，对服务方来说，它基于SolrCloud构建了搜索服务，包含两个集群，ZooKeeper集群和Solr集群，然后在前端通过Nginx来进行反向代理，达到负载均衡的目的。
+服务消费方就是调用服务进行查询，给出查询条件（满足Solr的REST-like接口）。
+
+应用设计
+
+基于上面的示例场景，我们打算使用ZooKeeper集群作为服务注册中心。注册中心会暴露给服务提供方和服务消费方，所以注册服务的时候，服务先提供方只需要提供Nginx的地址给注册中心，但是注册中心并不会把这个地址暴露给服务消费方，如图所示：
+provider-registry-consumer
+我们先定义一下，通信双方需要使用的接口，如下所示：
+01
+	package org.shirdrn.platform.dubbo.service.rpc.api;
+02
+	 
+03
+	public interface SolrSearchService {
+04
+	 
+05
+	    String search(String collection, String q, ResponseType type, int start, int rows);
+06
+	     
+07
+	    public enum ResponseType {
+08
+	        JSON,
+09
+	        XML
+10
+	    }  
+11
+	}
+
+基于上图中的设计，下面我们分别详细说明Provider和Consumer的设计及实现。
+
+    Provider服务设计
+
+Provider所发布的服务组件，包含了一个SolrCloud集群，在SolrCloud集群前端又加了一个反向代理层，使用Nginx来均衡负载。Provider的搜索服务系统，设计如下图所示：
+solrcloud-cluster
+上图中，实际Nginx中将请求直接转发内部的Web Servers上，在这个过程中，使用ZooKeeper来进行协调：从多个分片（Shard）服务器上并行搜索，最后合并结果。我们看一下Nginx配置的内容片段：
+01
+	user  nginx;
+02
+	worker_processes  4;
+03
+	 
+04
+	error_log  /var/log/nginx/error.log warn;
+05
+	pid        /var/run/nginx.pid;
+06
+	 
+07
+	 
+08
+	events {
+09
+	    worker_connections  1024;
+10
+	}
+11
+	 
+12
+	 
+13
+	http {
+14
+	    include       /etc/nginx/mime.types;
+15
+	    default_type  application/octet-stream;
+16
+	 
+17
+	    log_format  main  '$remote_addr - $remote_user [$time_local] "$request" '
+18
+	                      '$status $body_bytes_sent "$http_referer" '
+19
+	                      '"$http_user_agent" "$http_x_forwarded_for"';
+20
+	 
+21
+	    access_log  /var/log/nginx/access.log  main;
+22
+	 
+23
+	    sendfile        on;
+24
+	    #tcp_nopush     on;
+25
+	 
+26
+	    keepalive_timeout  65;
+27
+	 
+28
+	    #gzip  on;
+29
+	 
+30
+	    upstream master {
+31
+	        server slave1:8888 weight=1;
+32
+	        server slave4:8888 weight=1;
+33
+	        server slave6:8888 weight=1;
+34
+	    }
+35
+	 
+36
+	    server {
+37
+	        listen 80;
+38
+	        server_name master;
+39
+	        location / {
+40
+	            root /usr/share/nginx/html/solr-cloud;
+41
+	            index  index.html index.htm;
+42
+	            proxy_pass   http://master;
+43
+	            include /home/hadoop/servers/nginx/conf/proxy.conf;
+44
+	        }
+45
+	    }
+46
+	}
+
+一共配置了3台Solr服务器，因为SolrCloud集群中每一个节点都可以接收搜索请求，然后由整个集群去并行搜索。最后，我们要通过Dubbo服务框架来基于已有的系统来开发搜索服务，并通过Dubbo的注册中心来发布服务。
+首先需要实现服务接口，实现代码如下所示：
+01
+	package org.shirdrn.platform.dubbo.service.rpc.server;
+02
+	 
+03
+	import java.io.IOException;
+04
+	import java.util.HashMap;
+05
+	import java.util.Map;
+06
+	 
+07
+	import org.apache.commons.logging.Log;
+08
+	import org.apache.commons.logging.LogFactory;
+09
+	import org.shirdrn.platform.dubbo.service.rpc.api.SolrSearchService;
+10
+	import org.shirdrn.platform.dubbo.service.rpc.utils.QueryPostClient;
+11
+	import org.springframework.context.support.ClassPathXmlApplicationContext;
+12
+	 
+13
+	public class SolrSearchServer implements SolrSearchService {
+14
+	 
+15
+	    private static final Log LOG = LogFactory.getLog(SolrSearchServer.class);
+16
+	    private String baseUrl;
+17
+	    private final QueryPostClient postClient;
+18
+	    private static final Map<ResponseType, FormatHandler> handlers = new HashMap<ResponseType, FormatHandler>(0);
+19
+	    static {
+20
+	        handlers.put(ResponseType.XML, new FormatHandler() {
+21
+	            public String format() {
+22
+	                return "&wt=xml";
+23
+	            }
+24
+	        });
+25
+	        handlers.put(ResponseType.JSON, new FormatHandler() {
+26
+	            public String format() {
+27
+	                return "&wt=json";
+28
+	            }
+29
+	        });
+30
+	    }
+31
+	     
+32
+	    public SolrSearchServer() {
+33
+	        super();
+34
+	        postClient = QueryPostClient.newIndexingClient(null);
+35
+	    }
+36
+	     
+37
+	    public void setBaseUrl(String baseUrl) {
+38
+	        this.baseUrl = baseUrl;
+39
+	    }
+40
+	 
+41
+	    public String search(String collection, String q, ResponseType type,
+42
+	            int start, int rows) {
+43
+	        StringBuffer url = new StringBuffer();
+44
+	        url.append(baseUrl).append(collection).append("/select?").append(q);
+45
+	        url.append("&start=").append(start).append("&rows=").append(rows);
+46
+	        url.append(handlers.get(type).format());
+47
+	        LOG.info("[REQ] " + url.toString());
+48
+	        return postClient.request(url.toString());
+49
+	    }
+50
+	     
+51
+	    interface FormatHandler {
+52
+	        String format();
+53
+	    }
+54
+	     
+55
+	    public static void main(String[] args) throws IOException {
+56
+	        String config = SolrSearchServer.class.getPackage().getName().replace('.', '/') + "/search-provider.xml";
+57
+	        ClassPathXmlApplicationContext context = new ClassPathXmlApplicationContext(config);
+58
+	        context.start();
+59
+	        System.in.read();
+60
+	    }
+61
+	 
+62
+	}
+
+对应的Dubbo配置文件为search-provider.xml，内容如下所示：
+01
+	<?xml version="1.0" encoding="UTF-8"?>
+02
+	 
+03
+	<beans xmlns="http://www.springframework.org/schema/beans"
+04
+	    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:dubbo="http://code.alibabatech.com/schema/dubbo"
+05
+	    xsi:schemaLocation="http://www.springframework.org/schema/beans http://www.springframework.org/schema/beans/spring-beans-2.5.xsd
+06
+	    http://code.alibabatech.com/schema/dubbo http://code.alibabatech.com/schema/dubbo/dubbo.xsd">
+07
+	 
+08
+	    <dubbo:application name="search-provider" />
+09
+	    <dubbo:registry address="zookeeper://slave1:2188?backup=slave3:2188,slave4:2188" />
+10
+	    <dubbo:protocol name="dubbo" port="20880" />
+11
+	    <bean id="searchService" class="org.shirdrn.platform.dubbo.service.rpc.server.SolrSearchServer">
+12
+	        <property name="baseUrl" value="http://nginx-lbserver/solr-cloud/" />
+13
+	    </bean>
+14
+	    <dubbo:service interface="org.shirdrn.platform.dubbo.service.rpc.api.SolrSearchService" ref="searchService" />
+15
+	 
+16
+	</beans>
+
+上面，Dubbo服务注册中心指定ZooKeeper的地址：zookeeper://slave1:2188?backup=slave3:2188,slave4:2188，使用Dubbo协议。配置服务接口的时候，可以按照Spring的Bean的配置方式来配置，注入需要的内容，我们这里指定了搜索集群的Nginx反向代理地址http://nginx-lbserver/solr-cloud/。
+
+    Consumer调用服务设计
+
+这个就比较简单了，拷贝服务接口，同时要配置一下Dubbo的配置文件，写个简单的客户端调用就可以实现。客户端实现的Java代码如下所示：
+01
+	package org.shirdrn.platform.dubbo.service.rpc.client;
+02
+	 
+03
+	import java.util.concurrent.Callable;
+04
+	import java.util.concurrent.Future;
+05
+	 
+06
+	import org.shirdrn.platform.dubbo.service.rpc.api.SolrSearchService;
+07
+	import org.shirdrn.platform.dubbo.service.rpc.api.SolrSearchService.ResponseType;
+08
+	import org.springframework.beans.BeansException;
+09
+	import org.springframework.context.support.AbstractXmlApplicationContext;
+10
+	import org.springframework.context.support.ClassPathXmlApplicationContext;
+11
+	 
+12
+	import com.alibaba.dubbo.rpc.RpcContext;
+13
+	 
+14
+	public class SearchConsumer {
+15
+	     
+16
+	    private final String collection;
+17
+	    private AbstractXmlApplicationContext context;
+18
+	    private SolrSearchService searchService;
+19
+	     
+20
+	    public SearchConsumer(String collection, Callable<AbstractXmlApplicationContext> call) {
+21
+	        super();
+22
+	        this.collection = collection;
+23
+	        try {
+24
+	            context = call.call();
+25
+	            context.start();
+26
+	            searchService = (SolrSearchService) context.getBean("searchService");
+27
+	        } catch (BeansException e) {
+28
+	            e.printStackTrace();
+29
+	        } catch (Exception e) {
+30
+	            e.printStackTrace();
+31
+	        }
+32
+	    }
+33
+	     
+34
+	    public Future<String> asyncCall(final String q, final ResponseType type, final int start, final int rows) {
+35
+	        Future<String> future = RpcContext.getContext().asyncCall(new Callable<String>() {
+36
+	            public String call() throws Exception {
+37
+	                return search(q, type, start, rows);
+38
+	            }
+39
+	        });
+40
+	        return future;
+41
+	    }
+42
+	     
+43
+	    public String syncCall(final String q, final ResponseType type, final int start, final int rows) {
+44
+	        return search(q, type, start, rows);
+45
+	    }
+46
+	 
+47
+	    private String search(final String q, final ResponseType type, final int start, final int rows) {
+48
+	        return searchService.search(collection, q, type, start, rows);
+49
+	    }
+50
+	     
+51
+	    public static void main(String[] args) throws Exception {
+52
+	        final String collection = "tinycollection";
+53
+	        final String beanXML = "search-consumer.xml";
+54
+	        final String config = SearchConsumer.class.getPackage().getName().replace('.', '/') + "/" + beanXML;
+55
+	        SearchConsumer consumer = new SearchConsumer(collection, new Callable<AbstractXmlApplicationContext>() {
+56
+	            public AbstractXmlApplicationContext call() throws Exception {
+57
+	                final AbstractXmlApplicationContext context = new ClassPathXmlApplicationContext(config);
+58
+	                return context;
+59
+	            }
+60
+	        });
+61
+	         
+62
+	        String q = "q=上海&fl=*&fq=building_type:1";
+63
+	        int start = 0;
+64
+	        int rows = 10;
+65
+	        ResponseType type  = ResponseType.XML;
+66
+	        for (int k = 0; k < 10; k++) {
+67
+	            for (int i = 0; i < 10; i++) {
+68
+	                start = 1 * 10 * i;
+69
+	                if(i % 2 == 0) {
+70
+	                    type = ResponseType.XML;
+71
+	                } else {
+72
+	                    type = ResponseType.JSON;
+73
+	                }
+74
+	//              String result = consumer.syncCall(q, type, start, rows);
+75
+	//              System.out.println(result);
+76
+	                Future<String> future = consumer.asyncCall(q, type, start, rows);
+77
+	//              System.out.println(future.get());
+78
+	            }
+79
+	        }
+80
+	    }
+81
+	}
+
+查询的时候，需要提供查询字符串，符合Solr语法，例如“q=上海&fl=*&fq=building_type:1”。配置文件，我们使用search-consumer.xml，内容如下所示：
+01
+	<?xml version="1.0" encoding="UTF-8"?>
+02
+	 
+03
+	<beans xmlns="http://www.springframework.org/schema/beans"
+04
+	    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:dubbo="http://code.alibabatech.com/schema/dubbo"
+05
+	    xsi:schemaLocation="http://www.springframework.org/schema/beans http://www.springframework.org/schema/beans/spring-beans-2.5.xsd
+06
+	    http://code.alibabatech.com/schema/dubbo http://code.alibabatech.com/schema/dubbo/dubbo.xsd">
+07
+	 
+08
+	    <dubbo:application name="search-consumer" />
+09
+	    <dubbo:registry address="zookeeper://slave1:2188?backup=slave3:2188,slave4:2188" />
+10
+	    <dubbo:reference id="searchService" interface="org.shirdrn.platform.dubbo.service.rpc.api.SolrSearchService" />
+11
+	 
+12
+	</beans>
+
+运行说明
+
+首先保证服务注册中心的ZooKeeper集群正常运行，然后启动SolrSearchServer，启动的时候直接将服务注册到 ZooKeeper集群存储中，可以通过ZooKeeper的客户端脚本来查看注册的服务数据。一切正常以后，可以启动运行客户端 SearchConsumer，调用SolrSearchServer所实现的远程搜索服务。
+
+参考链接
+
+    https://github.com/alibaba/dubbo
+    http://alibaba.github.io/dubbo-doc-static/Home-zh.htm
+    http://alibaba.github.io/dubbo-doc-static/User+Guide-zh.htm
+    http://alibaba.github.io/dubbo-doc-static/Developer+Guide-zh.htm
+    http://alibaba.github.io/dubbo-doc-static/Administrator+Guide-zh.htm
+    http://alibaba.github.io/dubbo-doc-static/FAQ-zh.htm
+
+Creative Commons License
+
+本文基于署名-非商业性使用-相同方式共享 4.0许可协议发布，欢迎转载、使用、重新发布，但务必保留文章署名时延军（包含链接：http://shiyanjun.cn），不得用于商业目的，基于本文修改后的作品务必以相同的许可发布。如有任何疑问，请与我联系。
+Post navigation
+← Hadoop Streaming原理及实践
+基于Dubbo的Hessian协议实现远程调用 →
+评论(16)： “Dubbo实现RPC调用使用入门”
+
+    雨天	
+    2013-09-12 21:35:36
+
+    不错,最近也在研究dubbo,希望有更多关于dubbo的实践
+    回复	
+    ripflowers@gmail.com	
+    2013-09-13 15:44:14
+
+     
+
+    hi，哥们儿，你好
+
+    跟你咨询个事儿，我们现在用的框架跟你差不多，rpc也是用的dubbo，然后底层搜索也是用的solr，但是有一个问题一直没有解决，就是dubbo调 用solr的时候时常会出现invoke time out的问题，经查验主要的时间发费在dubbo用solrj发请求到solr接受到请求这段时间，solr的QTime都很短，怀疑是solrj的 httpclient的连接数问题，现在调大了，但是还是时常出现这样的问题，想问你一下，有没有遇到类似问题
+
+     
+
+    多谢！！
+    回复	
+        Yanjun	Yanjun	
+        2013-09-13 20:47:53
+
+        你先定位一下问题到底出在哪里，我觉得不会是SOLR的问题，多数是Dubbo那哪里配置的问题吧。我直接对SolrCloud集群做过压测，没出现过超时的现象，只是Tomcat撑不住导致无法处理请求。
+        回复	
+    x.d zhang	
+    2014-02-13 18:00:13
+
+    你好，请教个问题，dubbo2.5.3版本目前依赖的spring2.5.6.SEC03,能不能将spring升级到3.0+?
+    回复	
+        Yanjun	Yanjun	
+        2014-02-19 16:59:25
+
+        应该可以升级吧，不过，还是建议在线下测试验证一下。
+        回复	
+    carol	
+    2015-03-05 11:33:37
+
+    在学习dubbo的过程中有几个问题请教一下：
+    1，dubbo除按生产者按照dubbo规范发布服务以外，是否还存在其他方式
+    2，作为消费者，是不是其他语言开发的系统也可以使用除j2ee系统以外
+    期待您的回复
+    回复	
+        Yanjun	Yanjun	
+        2015-03-05 20:31:54
+
+        都可以的，你可以看我的另外2篇文章：http://shiyanjun.cn/archives/349.html和http://shiyanjun.cn/archives/325.html
+        回复	
+            laohu	
+            2015-12-10 19:26:07
+
+            受用了，非常感谢
+            回复	
+    longyuanknight	
+    2015-03-26 20:27:32
+
+    有个关于dubbo的问题请假下，按照说明，HTTP协议可以提供给JS直接调用，我用HTTPClient去调用，一直没有找到正确的调用方式，不知道你有什么建议？
+    回复	
+        Yanjun	Yanjun	
+        2015-03-27 09:37:42
+
+        Dubbo不支持你说的那种调用方式，原因可以查看这里：https://github.com/alibaba/dubbo/issues/54
+        如果你非要用REST或类似REST方式的调用，可以参考这里：https://github.com/dangdangdotcom/dubbox
+        回复	
+            longyuanknight	
+            2015-03-27 16:45:36
+
+            谢谢。已经在用当当的dubbox，只是对dubbo文档里面说的支持HTTP 调用，特地去测试了下。发现确实如上所说application/x-java-serialized-object。因此想问下其他人是不是在不改用 REST方式能够用HTTP直接访问。如果不行，那我还是安耽去用dubbox提供的rest方式好了。
+            回复	
+    littltbao	
+    2015-04-09 09:11:49
+
+    …你这样实现服务,相当于提供了一个客户端的功能….
+    回复	
+    Skylnsye	
+    2015-09-01 10:10:02
+
+    您好，我想问下，我是用的 dubbox 配置的rest 服务，为什么 注册到zookeeper 之后，仍然是只能 通过 原有服务提供方的地址访问，不能通过服务中心调用。
+    回复	
+    moon	
+    2016-07-22 10:11:08
+
+    我有一个疑问??你前面使用了nginx做了反向代理,这个时候已经决定走那个 搜索服务器了,而你这个dubbo框架,的服务又注册到指定的服务器上面了,他是不是接受到请求之后又重新发送给对应的服务处理呢,如果是这样的那么你的 nginx和zookeper是不是反而是多此一举了,我先声明一点,dubbo服务是为了解决内部系统的耦合问题的,也就说业务系统和订单系统之间存在 关联的时候,就需要提供一个公用的接口,并且暴露出来,这样业务系统就能在自己系统里面调用订单系统的服务.这样才是dubbo的真正用法
+    回复	
+    落花时节又逢君	
+    2016-10-03 14:51:42
+
+    请问作者，图中的app1 和app2是两个不同的应用，还是一个solrcloud?
+    回复	
+        Yanjun	Yanjun	
+        2016-10-05 11:15:03
+
+        你可以看成是同一个SolrCloud集群，按照业务划分，app1和app2是逻辑独立的，比如app1是有关用户基础信息的，而app2有关行为信息的。
+        回复	
+
+发表评论
+
+电子邮件地址不会被公开。 必填项已用*标注
+
+姓名 *
+
+电子邮件 *
+
+站点
+
+评论
+
+最新文章
+
+    Spark RPC通信层设计原理分析
+    Apache Flink：特性、概念、组件栈、架构及原理分析
+    Flume日志收集分层架构应用实践
+    Apache Storm内部原理分析
+    MapReduce V1：MapTask执行流程分析
+    基于协同过滤的推荐方法
+    MapReduce V1：TaskTracker端启动Task流程分析
+    MapReduce V1：TaskTracker设计要点概要分析
+    k-medoids聚类算法实现
+    Bisecting k-means聚类算法实现
+
+文章分类
+
+    开源技术 (82)
+        Akka (3)
+        Crunch (1)
+        Dubbo (4)
+        ElasticSearch (1)
+        Flink (1)
+        Flume (2)
+        Hadoop (23)
+        Hive (2)
+        Hue (1)
+        Impala (2)
+        Mahout (1)
+        Maven (1)
+        Mina (6)
+        Mybatis (1)
+        Oozie (4)
+        Pig (1)
+        Solr (5)
+        Spark (7)
+        Sqoop (3)
+        Storm (5)
+        Thrift (2)
+        Web Services (1)
+        ZooKeeper (3)
+    数据库 (5)
+        NoSQL数据库 (4)
+            HBase (3)
+            Redis (1)
+        关系数据库 (1)
+            MySQL (1)
+    数据挖掘 (10)
+    服务器 (4)
+        Ganglia (1)
+        HAProxy (1)
+        Memcached (1)
+        Nginx (1)
+    算法 (8)
+    编程语言 (4)
+        Java (2)
+        Node.js (1)
+        PHP (1)
+
+文章存档
+
+    2016年九月 (1)
+    2016年四月 (1)
+    2016年二月 (3)
+    2015年十二月 (5)
+    2015年十一月 (4)
+    2015年十月 (2)
+    2015年九月 (1)
+    2015年八月 (3)
+    2015年七月 (1)
+    2015年六月 (1)
+    2015年五月 (1)
+    2015年四月 (1)
+    2015年三月 (1)
+    2015年二月 (1)
+    2015年一月 (1)
+    2014年十二月 (2)
+    2014年十一月 (1)
+    2014年十月 (3)
+    2014年九月 (1)
+    2014年八月 (1)
+    2014年七月 (2)
+    2014年六月 (2)
+    2014年五月 (2)
+    2014年四月 (1)
+    2014年三月 (14)
+    2014年二月 (4)
+    2014年一月 (1)
+    2013年十二月 (3)
+    2013年十一月 (5)
+    2013年十月 (6)
+    2013年九月 (13)
+    2013年八月 (21)
+
+全站标签
+JAX-WS Redis Hive Mahout C4.5 k-medoids ElasticSearch MapReduce Hadoop2 排序 Java Hadoop Spark-2.0.0 Thrift Kafka Tomcat Pig Ganglia libsvm Dubbo CF SQL Hessian JRegwex Oozie YARN SolrCloud 决策树 ZooKeeper HWI Mybatis Spring Maven Storm Sqoop HBase Node.js Crunch HDFS Akka 分类 Solr Flink 聚类 Hadoop-1.2.1 Web Services K-means Spark Nginx Impala Memcached Flume Hue ID3 DBSCAN JVM SVM HAProxy MySQL Mina PHP JStorm
+最新评论
+
+    HanLinnnn: 博主你好，时间过那么久不知道是否还愿意回答我的问题，电脑在跑 测试集的文件时总是提示java.lang.OutOfMemo ryError: Java heap...
+    sirui: 不错，谢谢！ 分享一篇基于真实的第三方支付项目系统架构实战经验而形成的一整 套分布式服务化系统架构技术解决方案实战内容：http://w ww.roncoo.com/course/view/f...
+    小鱼: 楼主，我想问下，我用的是storm 1.0.2，spoutConf.forceFromStart 这个属性该怎么办啊？结果不发他也增加
+    kaixin: KeeperErrorCode = NoNode for /kafka/brokers/topics/test/par titions 我按上文写的，出现这个错误。该如何办呢？有qq吗？
+    落花时节又逢君: 请问作者，图中的app1 和app2是两个不同的应用，还是一个solrcloud?
+    Spark: 您好，那个i的自增为什么只执行一次？
+    kaixin: 最后的hdfs相关的class，是需要在maven加入jar 对吗？好像博主没有写明。
+    谢: 楼主你好，请问kafka+spark streaming做实时分析可以吗？
+    solq: 非常棒，打算出书吗
+    ca585: 赞一个 非常不错 颇有个性
+
+站点管理
+
+    登录
+    文章RSS
+    评论RSS
+    WordPress.org
+
+站长统计 | 今日IP[1271] | 今日PV[1950] | 昨日IP[1755] | 昨日PV[2678] | 当前在线[30]
+ww
